@@ -1,5 +1,4 @@
 import { WebSocket } from 'ws';
-import fetch from 'node-fetch';
 import EventEmitter from 'events';
 
 export interface UltravoxConfig {
@@ -30,7 +29,7 @@ export class UltravoxService extends EventEmitter {
     constructor(config: UltravoxConfig) {
         super();
         this.config = {
-            systemPrompt: "You are a helpful assistant. Please respond naturally and engage in conversation.",
+            systemPrompt: "You are a helpful customer service assistant. Please respond naturally and engage in conversation.",
             model: "fixie-ai/ultravox",
             voice: "Riya-Rao-English-Indian",
             sampleRate: 8000,
