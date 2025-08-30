@@ -2,6 +2,34 @@ import { JsonStringMap } from "../protocol/core";
 import { BotTurnDisposition } from "../protocol/voice-bots";
 import { TTSService } from "./tts-service";
 
+export class BotResponse {
+    disposition: BotTurnDisposition;
+    text: string;
+    confidence?: number;
+    audioBytes?: Uint8Array;
+    endSession?: boolean;
+
+    constructor(disposition: BotTurnDisposition, text: string) {
+        this.disposition = disposition;
+        this.text = text;
+    }
+
+    withConfidence(confidence: number): BotResponse {
+        this.confidence = confidence;
+        return this;
+    }
+
+    withAudioBytes(audioBytes: Uint8Array): BotResponse {
+        this.audioBytes = audioBytes;
+        return this;
+    }
+
+    withEndSession(endSession: boolean): BotResponse {
+        this.endSession = endSession;
+        return this;
+    }
+}
+
 /*
 * This class provides support for retreiving a Bot Resource based on the supplied
 * connection URL and input variables.
@@ -57,33 +85,5 @@ export class BotResource {
                 .withConfidence(1.0)
                 .withEndSession(true)
                 .withAudioBytes(audioBytes));
-    }
-}
-
-export class BotResponse {
-    disposition: BotTurnDisposition;
-    text: string;
-    confidence?: number;
-    audioBytes?: Uint8Array;
-    endSession?: boolean;
-
-    constructor(disposition: BotTurnDisposition, text: string) {
-        this.disposition = disposition;
-        this.text = text;
-    }
-
-    withConfidence(confidence: number): BotResponse {
-        this.confidence = confidence;
-        return this;
-    }
-
-    withAudioBytes(audioBytes: Uint8Array): BotResponse {
-        this.audioBytes = audioBytes;
-        return this;
-    }
-
-    withEndSession(endSession: boolean): BotResponse {
-        this.endSession = endSession;
-        return this;
     }
 }

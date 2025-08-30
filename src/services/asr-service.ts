@@ -1,5 +1,15 @@
 import EventEmitter from 'events';
 
+export class Transcript {
+    text: string;
+    confidence: number;
+
+    constructor(text: string, confidence: number) {
+        this.text = text;
+        this.confidence = confidence;
+    }
+}
+
 /*
 * This class provides ASR support for the incoming audio from the Client.
 * The following events are expected from the session:
@@ -61,15 +71,5 @@ export class ASRService {
 
         this.state = 'Processing';
         return this;
-    }
-}
-
-export class Transcript {
-    text: string;
-    confidence: number;
-
-    constructor(text: string, confidence: number) {
-        this.text = text;
-        this.confidence = confidence;
     }
 }

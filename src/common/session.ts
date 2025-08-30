@@ -21,14 +21,13 @@ import {
 } from '../protocol/voice-bots';
 import { MessageHandlerRegistry } from '../websocket/message-handlers/message-handler-registry';
 import {
-    BotService,
-    BotResource,
-    BotResponse
-} from '../services/bot-service';
+    UltravoxBotService,
+    UltravoxBotResource,
+    UltravoxBotResponse
+} from '../services/ultravox-bot-service';
 import {
-    ASRService,
-    Transcript
-} from '../services/asr-service';
+    UltravoxASRService
+} from '../services/ultravox-asr-service';
 import { DTMFService } from '../services/dtmf-service';
 
 export class Session {
@@ -38,8 +37,8 @@ export class Session {
     private ws;
 
     private messageHandlerRegistry = new MessageHandlerRegistry();
-    private botService = new BotService();
-    private asrService: ASRService | null = null;
+    private botService: UltravoxBotService;
+    private asrService: UltravoxASRService | null = null;
     private dtmfService: DTMFService | null = null;
     private url;
     private clientSessionId;
@@ -48,7 +47,7 @@ export class Session {
     private lastClientSequenceNumber = 0;
     private inputVariables: JsonStringMap = {};
     private selectedMedia: MediaParameter | undefined;
-    private selectedBot: BotResource | null = null;
+    private selectedBot: UltravoxBotResource | null = null;
     private isCapturingDTMF = false;
     private isAudioPlaying = false;
 
@@ -56,6 +55,13 @@ export class Session {
         this.ws = ws;
         this.clientSessionId = sessionId;
         this.url = url;
+        
+        // Initialize Ultravox bot service with API key from environment
+        const apiKey = process.env.ULTRAVOX_API_KEY;
+        if (!apiKey) {
+            throw new Error('ULTRAVOX_API_KEY environment variable is required');
+        }
+        this.botService = new UltravoxBotService(apiKey);
     }
 
     close() {
@@ -221,7 +227,7 @@ export class Session {
     */
     checkIfBotExists(): Promise<boolean> {
         return this.botService.getBotIfExists(this.url, this.inputVariables)
-            .then((selectedBot: BotResource | null) => {
+            .then((selectedBot: UltravoxBotResource | null) => {
                 this.selectedBot = selectedBot;
                 return this.selectedBot != null;
             });
@@ -240,7 +246,7 @@ export class Session {
         }
 
         this.selectedBot.getInitialResponse()
-            .then((response: BotResponse) => {
+            .then((response: UltravoxBotResponse) => {
                 if (response.text) {
                     this.sendTurnResponse(response.disposition, response.text, response.confidence);
                 }
@@ -269,46 +275,62 @@ export class Session {
         }
 
         /*
-        * For this implementation, we are going to ignore input while there
-        * is audio playing. You may choose to continue to process audio if
-        * you want to enable support for Barge-In scenarios.
+        * Handle barge-in by stopping current audio and processing new input
         */
         if (this.isAudioPlaying) {
-            this.asrService = null;
+            // Send barge-in event and stop current audio
+            this.sendBargeIn();
+            this.setIsAudioPlaying(false);
+            
+            // Reset services for new input
+            if (this.asrService) {
+                this.asrService.disconnect();
+                this.asrService = null;
+            }
             this.dtmfService = null;
-            return;
         }
 
-        if (!this.asrService || this.asrService.getState() === 'Complete') {
-            this.asrService = new ASRService()
+        if (!this.asrService || this.asrService.getState() === 'Complete' || this.asrService.getState() === 'Ready') {
+            const apiKey = process.env.ULTRAVOX_API_KEY;
+            if (!apiKey) {
+                console.error('ULTRAVOX_API_KEY not configured');
+                this.sendDisconnect('error', 'Service configuration error', {});
+                return;
+            }
+
+            this.asrService = new UltravoxASRService(apiKey);
+            
+            // Initialize the service
+            this.asrService.initialize().catch((error) => {
+                console.error('Failed to initialize Ultravox ASR:', error);
+                this.sendDisconnect('error', 'Failed to initialize speech recognition', {});
+            });
+
+            this.asrService
                 .on('error', (error: any) => {
                     if (this.isCapturingDTMF) {
                         return;
                     }
                     
-                    const message = 'Error during Speech Recognition.';
+                    const message = 'Error during speech recognition with Ultravox.';
                     console.log(`${message}: ${error}`);
                     this.sendDisconnect('error', message, {});
                 })
-                .on('final-transcript', (transcript: Transcript) => {
+                .on('agent-response', (response: { text: string, confidence: number }) => {
                     if (this.isCapturingDTMF) {
                         return;
                     }
                     
-                    this.selectedBot?.getBotResponse(transcript.text)
-                        .then((response: BotResponse) => {
-                            if (response.text) {
-                                this.sendTurnResponse(response.disposition, response.text, response.confidence);
-                            }
-
-                            if (response.audioBytes) {
-                                this.sendAudio(response.audioBytes);
-                            }
-
-                            if (response.endSession) {
-                                this.sendDisconnect('completed', '', {});
-                            }
-                        });
+                    // Send the response directly from Ultravox
+                    this.sendTurnResponse('match', response.text, response.confidence);
+                })
+                .on('audio-response', (audioBuffer: Uint8Array) => {
+                    if (this.isCapturingDTMF) {
+                        return;
+                    }
+                    
+                    // Send audio response from Ultravox
+                    this.sendAudio(audioBuffer);
                 });
         }
 
@@ -328,21 +350,27 @@ export class Session {
         }
 
         /*
-        * For this implementation, we are going to ignore input while there
-        * is audio playing. You may choose to continue to process DTMF if
-        * you want to enable support for Barge-In scenarios.
+        * Handle barge-in for DTMF as well
         */
         if (this.isAudioPlaying) {
-            this.asrService = null;
+            this.sendBargeIn();
+            this.setIsAudioPlaying(false);
+            
+            if (this.asrService) {
+                this.asrService.disconnect();
+                this.asrService = null;
+            }
             this.dtmfService = null;
-            return;
         }
 
         // If we are capturing DTMF, flag it so we stop capturing audio,
         // and close down the audio capturing.
         if (!this.isCapturingDTMF) {
             this.isCapturingDTMF = true;
-            this.asrService = null;
+            if (this.asrService) {
+                this.asrService.disconnect();
+                this.asrService = null;
+            }
         }
 
         if (!this.dtmfService || this.dtmfService.getState() === 'Complete') {
@@ -354,7 +382,7 @@ export class Session {
                 })
                 .on('final-digits', (digits) => {
                     this.selectedBot?.getBotResponse(digits)
-                        .then((response: BotResponse) => {
+                        .then((response: UltravoxBotResponse) => {
                             if (response.text) {
                                 this.sendTurnResponse(response.disposition, response.text, response.confidence);
                             }
@@ -373,5 +401,28 @@ export class Session {
         }
 
         this.dtmfService.processDigit(digit);
+    }
+
+    // Clean up Ultravox connections when session closes
+    close() {
+        if (this.closed) {
+            return;
+        }
+
+        // Clean up Ultravox services
+        if (this.asrService) {
+            this.asrService.disconnect();
+        }
+        
+        if (this.selectedBot) {
+            this.selectedBot.disconnect();
+        }
+
+        try {
+            this.ws.close();
+        } catch {
+        }
+
+        this.closed = true;
     }
 };
