@@ -1,347 +1,392 @@
-import { WebSocket } from 'ws';
-import EventEmitter from 'events';
+import { WebSocket } from "ws";
+import EventEmitter from "events";
+import AudioConverter from "../utils/audio-converter.js";
+import config from "../config/config.js";
+import { getCurrentAgentStageConfig } from "../utils/promptUtils.js";
+import { logger } from "../utils/logger.js";
+import { updateActiveCall } from "../controllers/callController.js";
 
-export interface UltravoxConfig {
-    apiKey: string;
-    systemPrompt?: string;
-    model?: string;
-    voice?: string;
-    sampleRate?: number;
-}
+const DEFAULT_AGENT_CONFIG = config.DEFAULT_AGENT_CONFIG;
+const MODELS = config.MODELS;
 
-export interface UltravoxCallResponse {
-    joinUrl: string;
-    callId: string;
-}
+const ULTRAVOX_API_URL = process.env.ULTRAVOX_CALL_API + "/calls";
+const ULTRAVOX_API_KEY = process.env.ULTRAVOX_API_KEY;
+
+const ULTRAVOX_SAMPLE_RATE = 8000;
+const USER_MOBILE_NUMBER = process.env.USER_MOBILE_NUMBER || "+919898989898";
+const GENESYS_USER_NAME = process.env.INCOMING_CALL_CONFIG || "genesys";
 
 export class UltravoxService extends EventEmitter {
-    private config: UltravoxConfig;
-    private ws: WebSocket | null = null;
-    private isConnected = false;
-    private callId: string | null = null;
-    private lastInputSample = 0;
-    private lastOutputSample = 0;
+  constructor(phoneNumber = null) {
+    super();
 
-    // µ-law conversion lookup tables for performance
-    private ulawToLinearTable: Int16Array;
-    private linearToUlawTable: Uint8Array;
+    this.userPhoneNumber = phoneNumber || USER_MOBILE_NUMBER;
+    this.userName = GENESYS_USER_NAME;
+    this.ultravoxWs = null;
+    this.isConnected = false;
+    this.callId = null;
+    this.lastInputSample = 0;
+    this.lastOutputSample = 0;
 
-    constructor(config: UltravoxConfig) {
-        super();
-        this.config = {
-            systemPrompt: "You are a helpful customer service assistant. Please respond naturally and engage in conversation.",
-            model: "fixie-ai/ultravox",
-            voice: "Riya-Rao-English-Indian",
-            sampleRate: 8000,
-            ...config
-        };
-        this.initializeLookupTables();
+    this.ulawToLinearTable = null;
+    this.linearToUlawTable = null;
+
+    // Rate limiting for audio
+    this.audioQueue = [];
+    this.audioSendInterval = null;
+    this.audioSendRate = 50; // Send every 50ms
+    this.maxAudioQueueSize = 10; // Maximum queued audio chunks
+
+    // Rate limiting for messages
+    this.messageQueue = [];
+    this.isProcessingMessages = false;
+    this.messageDelay = 10; // 10ms between messages
+
+    // Transcript throttling
+    this.lastTranscriptTime = 0;
+    this.transcriptThrottleMs = 100; // Minimum 100ms between transcript emissions
+
+    AudioConverter.initializeLookupTables();
+
+    logger.info(
+      `UltravoxService initialized with phone number: ${this.userPhoneNumber}`
+    );
+  }
+
+  async buildCallConfig() {
+    const agentConfig = await getCurrentAgentStageConfig(
+      this.userPhoneNumber,
+      this.userName,
+      ""
+    );
+
+    const voice = agentConfig?.config?.voice || DEFAULT_AGENT_CONFIG.voice;
+    const model = agentConfig?.config?.model || DEFAULT_AGENT_CONFIG.model;
+    const temperature =
+      agentConfig?.config?.temperature || DEFAULT_AGENT_CONFIG.temperature;
+    const firstSpeaker =
+      agentConfig?.config?.firstSpeaker || DEFAULT_AGENT_CONFIG.firstSpeaker;
+    const systemPrompt =
+      (agentConfig?.systemPrompt || "") +
+        ` user mobile number is ${this.userPhoneNumber}` || "";
+    const toolsSchema = agentConfig?.toolsSchema || [];
+
+    const inactivityMessages =
+      agentConfig?.config?.inactivityMessages ||
+      DEFAULT_AGENT_CONFIG.inactivityMessages;
+
+    return {
+      systemPrompt,
+      model: MODELS[model] || model,
+      voice,
+      temperature,
+      firstSpeaker,
+      selectedTools: toolsSchema,
+      inactivityMessages,
+      medium: {
+        serverWebSocket: {
+          inputSampleRate: ULTRAVOX_SAMPLE_RATE,
+          outputSampleRate: ULTRAVOX_SAMPLE_RATE,
+          clientBufferSizeMs: 60,
+        },
+      },
+      vadSettings: {
+        turnEndpointDelay: "0.8s",
+        minimumTurnDuration: "0.2s",
+        minimumInterruptionDuration: "0.3s",
+        frameActivationThreshold: 0.2,
+      },
+    };
+  }
+
+  getUserPhoneNumber() {
+    return this.userPhoneNumber;
+  }
+
+  setUserPhoneNumber(phoneNumber) {
+    this.userPhoneNumber = phoneNumber;
+    console.log(`Phone number updated to: ${this.userPhoneNumber}`);
+  }
+
+  async createCall() {
+    if (!ULTRAVOX_API_KEY) throw new Error("Ultravox API key not configured");
+    if (!ULTRAVOX_API_URL) throw new Error("Ultravox API URL not configured");
+
+    const callConfig = await this.buildCallConfig();
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-API-Key": ULTRAVOX_API_KEY,
+    };
+
+    try {
+      const response = await fetch(ULTRAVOX_API_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(callConfig),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const ultravoxData = await response.json();
+      this.callId = ultravoxData.callId;
+
+      updateActiveCall({
+        ...ultravoxData,
+        userMobile: this.userPhoneNumber,
+        callType: "twilio"
+      });
+      return ultravoxData.joinUrl;
+    } catch (error) {
+      console.error("Ultravox API request failed:", error);
+      throw error;
+    }
+  }
+
+  async connect() {
+    if (this.isConnected) {
+      throw new Error("Already connected to Ultravox");
     }
 
-    private initializeLookupTables() {
-        // Create µ-law to linear lookup table
-        this.ulawToLinearTable = new Int16Array(256);
-        for (let i = 0; i < 256; i++) {
-            this.ulawToLinearTable[i] = this.ulawToLinearSlow(i);
-        }
+    try {
+      const joinUrl = await this.createCall();
+      console.log("Connecting to Ultravox...");
 
-        // Create linear to µ-law lookup table
-        this.linearToUlawTable = new Uint8Array(65536);
-        for (let i = 0; i < 65536; i++) {
-            const sample = i - 32768; // Convert to signed
-            this.linearToUlawTable[i] = this.linearToUlawSlow(sample);
-        }
-    }
+      this.ultravoxWs = new WebSocket(joinUrl);
 
-    private ulawToLinearSlow(ulawByte: number): number {
-        const BIAS = 0x84;
-        ulawByte = ~ulawByte & 0xff;
-        const sign = ulawByte & 0x80;
-        const exponent = (ulawByte >> 4) & 0x07;
-        const mantissa = ulawByte & 0x0f;
+      return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error("Ultravox connection timeout"));
+        }, 15000);
 
-        let sample = (mantissa << 3) + BIAS;
-        sample <<= exponent;
-        sample -= BIAS;
-
-        return sign ? -sample : sample;
-    }
-
-    private linearToUlawSlow(sample: number): number {
-        const BIAS = 0x84;
-        const CLIP = 32635;
-
-        sample = Math.max(-32768, Math.min(32767, Math.round(sample)));
-        const sign = (sample >> 8) & 0x80;
-        if (sign) sample = -sample;
-
-        if (sample > CLIP) sample = CLIP;
-        sample += BIAS;
-
-        let exponent = 7;
-        const expLuts = [0x4000, 0x2000, 0x1000, 0x800, 0x400, 0x200, 0x100];
-        for (const expLut of expLuts) {
-            if (sample >= expLut) break;
-            exponent--;
-        }
-
-        const mantissa = (sample >> (exponent + 3)) & 0x0f;
-        return ~(sign | (exponent << 4) | mantissa) & 0xff;
-    }
-
-    private ulawToLinear(ulawByte: number): number {
-        return this.ulawToLinearTable[ulawByte];
-    }
-
-    private linearToUlaw(sample: number): number {
-        const index = Math.max(0, Math.min(65535, sample + 32768));
-        return this.linearToUlawTable[index];
-    }
-
-    private applySmoothingFilter(samples: number[], previousSample = 0): { smoothedSamples: number[], lastSample: number } {
-        if (samples.length === 0) return { smoothedSamples: samples, lastSample: previousSample };
-
-        const smoothedSamples = new Array(samples.length);
-        const alpha = 0.95; // Smoothing factor
-
-        smoothedSamples[0] = alpha * samples[0] + (1 - alpha) * previousSample;
-
-        for (let i = 1; i < samples.length; i++) {
-            smoothedSamples[i] = alpha * samples[i] + (1 - alpha) * smoothedSamples[i - 1];
-        }
-
-        return {
-            smoothedSamples,
-            lastSample: smoothedSamples[smoothedSamples.length - 1],
-        };
-    }
-
-    private applyNoiseGate(samples: number[], threshold = 100): number[] {
-        return samples.map((sample) => {
-            return Math.abs(sample) < threshold ? 0 : sample;
+        this.ultravoxWs.on("open", () => {
+          clearTimeout(timeout);
+          this.isConnected = true;
+          console.log("Connected to Ultravox successfully");
+          this.startAudioProcessing();
+          this.emit("connected");
+          resolve();
         });
-    }
 
-    private applySoftLimiting(samples: number[], limit = 30000): number[] {
-        return samples.map((sample) => {
-            if (Math.abs(sample) > limit) {
-                const sign = sample >= 0 ? 1 : -1;
-                const compressed = Math.tanh(Math.abs(sample) / limit) * limit;
-                return sign * compressed;
-            }
-            return sample;
+        this.ultravoxWs.on("error", (error) => {
+          clearTimeout(timeout);
+          console.error("Ultravox connection error:", error);
+          this.emit("error", error);
+          reject(error);
         });
+
+        this.ultravoxWs.on("close", () => {
+          this.isConnected = false;
+          this.stopAudioProcessing();
+          console.log("Ultravox connection closed");
+          this.emit("disconnected");
+        });
+
+        this.ultravoxWs.on("message", (data, isBinary) => {
+          this.handleEvent(data, isBinary);
+        });
+      });
+    } catch (error) {
+      console.error("Failed to connect to Ultravox:", error);
+      throw error;
+    }
+  }
+
+  startAudioProcessing() {
+    if (this.audioSendInterval) {
+      clearInterval(this.audioSendInterval);
     }
 
-    private convertPcmuToPcm16(pcmuBuffer: Uint8Array): Buffer {
-        const pcmuData = Array.from(pcmuBuffer);
-        const linearSamples = pcmuData.map((byte) => this.ulawToLinear(byte));
+    this.audioSendInterval = setInterval(() => {
+      this.processAudioQueue();
+    }, this.audioSendRate);
+  }
 
-        // Apply audio processing
-        const processedSamples = this.applyNoiseGate(linearSamples, 50);
-        const limitedSamples = this.applySoftLimiting(processedSamples, 28000);
+  stopAudioProcessing() {
+    if (this.audioSendInterval) {
+      clearInterval(this.audioSendInterval);
+      this.audioSendInterval = null;
+    }
+    this.audioQueue = [];
+  }
 
-        // Apply smoothing
-        const { smoothedSamples, lastSample } = this.applySmoothingFilter(
-            limitedSamples,
-            this.lastInputSample
-        );
-        this.lastInputSample = lastSample;
-
-        // Convert to PCM16 bytes
-        const pcmData = new Array(smoothedSamples.length * 2);
-        for (let i = 0; i < smoothedSamples.length; i++) {
-            const sample = Math.round(smoothedSamples[i]);
-            pcmData[i * 2] = sample & 0xff;
-            pcmData[i * 2 + 1] = (sample >> 8) & 0xff;
-        }
-
-        return Buffer.from(pcmData);
+  processAudioQueue() {
+    if (this.audioQueue.length === 0 || !this.isConnected) {
+      return;
     }
 
-    private convertPcm16ToPcmu(pcm16Buffer: Buffer): Buffer {
-        const pcmBytes = Array.from(pcm16Buffer);
-        const linearSamples = [];
+    const audioData = this.audioQueue.shift();
+    try {
+      const pcm16Buffer = AudioConverter.convertPcmuToPcm16(audioData);
+      if (this.ultravoxWs && this.ultravoxWs.readyState === WebSocket.OPEN) {
+        this.ultravoxWs.send(pcm16Buffer);
+      }
+    } catch (error) {
+      console.error("Error processing audio from queue:", error);
+      this.emit("error", error);
+    }
+  }
 
-        // Convert PCM16 bytes to linear samples
-        for (let i = 0; i < pcmBytes.length - 1; i += 2) {
-            const lowByte = pcmBytes[i];
-            const highByte = pcmBytes[i + 1];
-            let sample = lowByte | (highByte << 8);
-
-            // Handle signed 16-bit
-            if (sample > 32767) {
-                sample -= 65536;
-            }
-            linearSamples.push(sample);
+  handleEvent(event, isBinary) {
+    try {
+      if (isBinary) {
+        const pcmuBuffer = AudioConverter.convertPcm16ToPcmu(event);
+        this.emit("audio", pcmuBuffer);
+        if (this.onMessage) {
+          this.onMessage(pcmuBuffer, true);
         }
+        return;
+      }
 
-        // Apply audio processing
-        const processedSamples = this.applyNoiseGate(linearSamples, 50);
-        const limitedSamples = this.applySoftLimiting(processedSamples, 28000);
+      const parsedEvent = JSON.parse(event.toString());
+      logger.debug(`Ultravox event received: ${JSON.stringify(parsedEvent)}`);
 
-        // Apply smoothing
-        const { smoothedSamples, lastSample } = this.applySmoothingFilter(
-            limitedSamples,
-            this.lastOutputSample
-        );
-        this.lastOutputSample = lastSample;
+      switch (parsedEvent.type) {
+        case "playback_clear_buffer":
+          this.emit("playback_clear_buffer");
+          break;
+        case "transcript":
+          this.handleTranscript(parsedEvent);
+          break;
+        case "agent_response":
+          this.emit("agent_response", parsedEvent);
+          break;
+        case "call_ended":
+          this.emit("call_ended", parsedEvent);
+          break;
+        case "state":
+          if (
+            parsedEvent.state === "listening" ||
+            parsedEvent.state === "done"
+          ) {
+            this.emit("state", parsedEvent);
+          }
+          break;
+        case "pong":
+          this.emit("pong");
+          break;
+        case "call_started":
+          this.emit("call_started");
+          break;
+        case "debug":
+          this.emit("debug", parsedEvent);
+          break;
+        case "error":
+          this.emit(
+            "error",
+            new Error(parsedEvent.message || "Unknown Ultravox error")
+          );
+          break;
+        default:
+          this.emit("message", parsedEvent);
+          break;
+      }
 
-        // Convert to µ-law
-        const pcmuData = smoothedSamples.map((sample) => this.linearToUlaw(Math.round(sample)));
+      if (this.onMessage) {
+        this.onMessage(event, false);
+      }
+    } catch (error) {
+      logger.error(`Error parsing Ultravox event: ${error}`);
+      this.emit("error", error);
+      if (this.onError) {
+        this.onError(error);
+      }
+    }
+  }
 
-        return Buffer.from(pcmuData);
+  handleTranscript(parsedEvent) {
+    const now = Date.now();
+
+    // Throttle transcript events
+    if (
+      now - this.lastTranscriptTime < this.transcriptThrottleMs &&
+      !parsedEvent.final
+    ) {
+      return; // Skip non-final transcripts that are too frequent
     }
 
-    async createCall(): Promise<string> {
-        const url = "https://api.ultravox.ai/api/calls";
-        const headers = {
-            "X-API-Key": this.config.apiKey,
-            "Content-Type": "application/json",
-        };
+    this.lastTranscriptTime = now;
 
-        const payload = {
-            systemPrompt: this.config.systemPrompt,
-            model: this.config.model,
-            voice: this.config.voice,
-            medium: {
-                serverWebSocket: {
-                    inputSampleRate: this.config.sampleRate,
-                    outputSampleRate: this.config.sampleRate,
-                },
-            },
-            vadSettings: {
-                turnEndpointDelay: "0.8s",
-                minimumTurnDuration: "0.2s",
-                minimumInterruptionDuration: "0.3s",
-                frameActivationThreshold: 0.2,
-            },
-            firstSpeaker: "FIRST_SPEAKER_AGENT",
-        };
+    this.emit("transcript", {
+      text: parsedEvent.delta || "",
+      isFinal: parsedEvent.final || false,
+      role: parsedEvent.role,
+    });
+  }
 
-        try {
-            const response = await fetch(url, {
-                method: "POST",
-                headers: headers,
-                body: JSON.stringify(payload),
-            });
-
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-
-            const data = await response.json() as UltravoxCallResponse;
-            this.callId = data.callId;
-            return data.joinUrl;
-        } catch (error) {
-            console.error("Ultravox API request failed:", error);
-            throw error;
-        }
+  sendAudio(pcmuBuffer) {
+    if (!this.isConnected || !this.ultravoxWs) {
+      console.warn("Cannot send audio: not connected to Ultravox");
+      return;
     }
 
-    async connect(): Promise<void> {
-        if (this.isConnected) {
-            throw new Error('Already connected to Ultravox');
-        }
+    // Add to queue instead of sending immediately
+    this.audioQueue.push(pcmuBuffer);
 
-        try {
-            const joinUrl = await this.createCall();
-            console.log('Connecting to Ultravox...');
+    // Prevent queue from growing too large
+    if (this.audioQueue.length > this.maxAudioQueueSize) {
+      this.audioQueue.shift(); // Remove oldest audio data
+      console.warn("Audio queue overflow, dropping oldest audio data");
+    }
+  }
 
-            this.ws = new WebSocket(joinUrl);
-
-            return new Promise((resolve, reject) => {
-                const timeout = setTimeout(() => {
-                    reject(new Error("Ultravox connection timeout"));
-                }, 15000);
-
-                this.ws!.on('open', () => {
-                    clearTimeout(timeout);
-                    this.isConnected = true;
-                    console.log('Connected to Ultravox successfully');
-                    this.emit('connected');
-                    resolve();
-                });
-
-                this.ws!.on('error', (error) => {
-                    clearTimeout(timeout);
-                    console.error('Ultravox connection error:', error);
-                    this.emit('error', error);
-                    reject(error);
-                });
-
-                this.ws!.on('close', () => {
-                    this.isConnected = false;
-                    console.log('Ultravox connection closed');
-                    this.emit('disconnected');
-                });
-
-                this.ws!.on('message', (data) => {
-                    if (Buffer.isBuffer(data)) {
-                        // Convert PCM16 to PCMU for Genesys
-                        const pcmuBuffer = this.convertPcm16ToPcmu(data);
-                        this.emit('audio', pcmuBuffer);
-                    } else {
-                        // Handle text messages from Ultravox
-                        try {
-                            const message = JSON.parse(data.toString());
-                            this.emit('message', message);
-                        } catch (error) {
-                            console.error('Failed to parse Ultravox message:', error);
-                        }
-                    }
-                });
-            });
-        } catch (error) {
-            console.error('Failed to connect to Ultravox:', error);
-            throw error;
-        }
+  sendMessage(message) {
+    if (!this.isConnected || !this.ultravoxWs) {
+      console.warn("Cannot send message: not connected to Ultravox");
+      return;
     }
 
-    sendAudio(pcmuBuffer: Uint8Array): void {
-        if (!this.isConnected || !this.ws) {
-            console.warn('Cannot send audio: not connected to Ultravox');
-            return;
-        }
+    // Add to message queue for rate limiting
+    this.messageQueue.push(message);
+    this.processMessageQueue();
+  }
 
-        try {
-            // Convert PCMU to PCM16 for Ultravox
-            const pcm16Buffer = this.convertPcmuToPcm16(pcmuBuffer);
-            this.ws.send(pcm16Buffer);
-        } catch (error) {
-            console.error('Error sending audio to Ultravox:', error);
-            this.emit('error', error);
-        }
+  async processMessageQueue() {
+    if (this.isProcessingMessages || this.messageQueue.length === 0) {
+      return;
     }
 
-    sendMessage(message: any): void {
-        if (!this.isConnected || !this.ws) {
-            console.warn('Cannot send message: not connected to Ultravox');
-            return;
+    this.isProcessingMessages = true;
+
+    while (this.messageQueue.length > 0) {
+      const message = this.messageQueue.shift();
+
+      try {
+        if (this.ultravoxWs && this.ultravoxWs.readyState === WebSocket.OPEN) {
+          this.ultravoxWs.send(JSON.stringify(message));
         }
+      } catch (error) {
+        console.error("Error sending message to Ultravox:", error);
+        this.emit("error", error);
+      }
 
-        try {
-            this.ws.send(JSON.stringify(message));
-        } catch (error) {
-            console.error('Error sending message to Ultravox:', error);
-            this.emit('error', error);
-        }
+      // Wait before sending next message
+      if (this.messageQueue.length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.messageDelay));
+      }
     }
 
-    disconnect(): void {
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
-        }
-        this.isConnected = false;
-        this.callId = null;
-    }
+    this.isProcessingMessages = false;
+  }
 
-    getCallId(): string | null {
-        return this.callId;
-    }
+  disconnect() {
+    this.stopAudioProcessing();
 
-    getConnectionStatus(): boolean {
-        return this.isConnected;
+    if (this.ultravoxWs) {
+      this.ultravoxWs.close();
+      this.ultravoxWs = null;
     }
+    this.isConnected = false;
+    this.callId = null;
+  }
+
+  getCallId() {
+    return this.callId;
+  }
+
+  getConnectionStatus() {
+    return this.isConnected;
+  }
 }
