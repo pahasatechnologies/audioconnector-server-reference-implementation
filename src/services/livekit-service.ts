@@ -1,5 +1,4 @@
 import { Room, RoomEvent, RemoteParticipant, RemoteTrack, RemoteAudioTrack, Track, LocalAudioTrack, AudioCaptureOptions } from 'livekit-client';
-import { AccessToken } from 'livekit-server-sdk';
 import EventEmitter from 'events';
 import AudioConverter from '../utils/audio-converter.js';
 import { getLiveKitConfig } from '../config/livekit-config.js';
@@ -47,20 +46,42 @@ export class LiveKitService extends EventEmitter {
     console.log(`Room name: ${this.roomName}`);
   }
 
-  private generateAccessToken(): string {
-    const token = new AccessToken(this.config.apiKey, this.config.apiSecret, {
-      identity: this.participantName,
-      ttl: '1h',
-    });
+  private async generateAccessToken(): Promise<string> {
+    try {
+      const response = await fetch(this.config.tokenApiUrl, {
+        method: 'POST',
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          identity: this.userPhoneNumber,
+          metadata: {
+            email: this.config.email,
+            mobile_number: this.userPhoneNumber,
+            stt: "Self-Hosted",
+            llm: "Self-Hosted", 
+            tts: "Self-Hosted",
+            orgId: this.config.orgId
+          }
+        })
+      });
 
-    token.addGrant({
-      room: this.roomName,
-      roomJoin: true,
-      canPublish: true,
-      canSubscribe: true,
-    });
+      if (!response.ok) {
+        throw new Error(`Token API request failed: ${response.status} ${response.statusText}`);
+      }
 
-    return token.toJwt();
+      const data = await response.json();
+      
+      if (!data.token) {
+        throw new Error('No token received from API');
+      }
+
+      return data.token;
+    } catch (error) {
+      console.error('Error generating access token:', error);
+      throw new Error(`Failed to generate access token: ${error.message}`);
+    }
   }
 
   async connect(): Promise<void> {
@@ -76,7 +97,7 @@ export class LiveKitService extends EventEmitter {
       // Set up event listeners
       this.setupEventListeners();
       
-      const token = this.generateAccessToken();
+      const token = await this.generateAccessToken();
       
       await this.room.connect(this.config.wsUrl, token);
       
