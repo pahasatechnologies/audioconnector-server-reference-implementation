@@ -1,7 +1,7 @@
 import { v4 as uuid } from "uuid";
 import { WebSocket } from "ws";
 import { MessageHandlerRegistry } from "./message-handlers/message-handler-registry.js";
-import { UltravoxService } from "../services/ultravox-service.js";
+import { LiveKitService } from "../services/livekit-service.js";
 import { DTMFService } from "../services/dtmf-service.js";
 
 export class Session {
@@ -12,7 +12,7 @@ export class Session {
     this.ws = ws;
 
     this.messageHandlerRegistry = new MessageHandlerRegistry();
-    this.ultravoxService = null;
+    this.livekitService = null;
     this.dtmfService = null;
     this.url = url;
     this.clientSessionId = sessionId;
@@ -60,8 +60,8 @@ export class Session {
       clearTimeout(this.transcriptTimer);
     }
 
-    if (this.ultravoxService) {
-      this.ultravoxService.disconnect();
+    if (this.livekitService) {
+      this.livekitService.disconnect();
     }
 
     try {
@@ -402,7 +402,7 @@ export class Session {
 
   async processBotStart() {
     try {
-      await this.initializeUltravox();
+      await this.initializeLiveKit();
       this.sendTurnResponse("match", "Hello! How can I help you today?", 1.0);
     } catch (error) {
       console.error("Error starting bot:", error);
@@ -410,31 +410,31 @@ export class Session {
     }
   }
 
-  async initializeUltravox() {
-    this.ultravoxService = new UltravoxService(this.userPhoneNumber);
+  async initializeLiveKit() {
+    this.livekitService = new LiveKitService(this.userPhoneNumber);
 
-    this.ultravoxService.on("connected", () => {
-      console.log("Ultravox connected successfully");
+    this.livekitService.on("connected", () => {
+      console.log("LiveKit connected successfully");
     });
 
-    this.ultravoxService.on("error", (error) => {
-      console.error("Ultravox error:", error);
+    this.livekitService.on("error", (error) => {
+      console.error("LiveKit error:", error);
       this.sendDisconnect("error", "Conversation service error", {});
     });
 
-    this.ultravoxService.on("audio", (audioBuffer) => {
+    this.livekitService.on("audio", (audioBuffer) => {
       this.sendAudio(audioBuffer);
     });
 
-    this.ultravoxService.on("message", (message) => {
-      this.handleUltravoxMessage(message);
+    this.livekitService.on("message", (message) => {
+      this.handleLiveKitMessage(message);
     });
 
-    this.ultravoxService.on("call_started", () => {
-      console.log("Ultravox call started");
+    this.livekitService.on("call_started", () => {
+      console.log("LiveKit call started");
     });
 
-    this.ultravoxService.on("transcript", (data) => {
+    this.livekitService.on("transcript", (data) => {
       console.log("transcript received:", data.text);
       this.sendTranscription(
         data.text || "(empty transcription)",
@@ -444,49 +444,49 @@ export class Session {
       );
     });
 
-    this.ultravoxService.on("agent_response", (parsedEvent) => {
+    this.livekitService.on("agent_response", (parsedEvent) => {
       console.log("Agent response received:", parsedEvent);
       const text = parsedEvent.text || "Agent responded.";
       this.sendTurnResponse("match", text, 1.0);
     });
 
-    this.ultravoxService.on("state", (parsedEvent) => {
+    this.livekitService.on("state", (parsedEvent) => {
       console.log("State change:", parsedEvent.state);
       if (parsedEvent.state === "done") {
         console.log("Turn ended");
       }
     });
 
-    this.ultravoxService.on("playback_clear_buffer", () => {
+    this.livekitService.on("playback_clear_buffer", () => {
       console.log("Clearing playback buffer (interruption)");
       this.sendBargeIn();
       this.setIsAudioPlaying(false);
     });
 
-    this.ultravoxService.on("call_ended", (parsedEvent) => {
+    this.livekitService.on("call_ended", (parsedEvent) => {
       console.log("Call ended:", parsedEvent);
-      this.sendDisconnect("complete", "Call ended by Ultravox", {});
+      this.sendDisconnect("complete", "Call ended by LiveKit", {});
     });
 
-    this.ultravoxService.on("debug", (parsedEvent) => {
+    this.livekitService.on("debug", (parsedEvent) => {
       console.log("Debug info:", parsedEvent);
     });
 
-    this.ultravoxService.on("pong", () => {
+    this.livekitService.on("pong", () => {
       console.log("Pong received (latency check)");
     });
 
-    this.ultravoxService.on("disconnected", () => {
-      console.log("Ultravox disconnected");
+    this.livekitService.on("disconnected", () => {
+      console.log("LiveKit disconnected");
       if (!this.disconnecting) {
-        this.sendDisconnect("error", "Ultravox disconnected unexpectedly", {});
+        this.sendDisconnect("error", "LiveKit disconnected unexpectedly", {});
       }
     });
 
-    await this.ultravoxService.connect();
+    await this.livekitService.connect();
   }
 
-  handleUltravoxMessage(message) {
+  handleLiveKitMessage(message) {
     try {
       console.log("&&&&&&&&&&&&&&", JSON.stringify(message));
       if (message.type === "transcript") {
@@ -503,7 +503,7 @@ export class Session {
         console.log("Turn ended");
       }
     } catch (error) {
-      console.error("Error handling Ultravox message:", error);
+      console.error("Error handling LiveKit message:", error);
     }
   }
 
@@ -521,17 +521,17 @@ export class Session {
       this.setIsAudioPlaying(false);
     }
 
-    if (this.ultravoxService && this.ultravoxService.getConnectionStatus()) {
+    if (this.livekitService && this.livekitService.getConnectionStatus()) {
       // Instead of sending immediately, use rate-limited audio sending
-      this.sendAudioToUltravox(data);
+      this.sendAudioToLiveKit(data);
     }
   }
 
-  // Rate-limited audio sending to Ultravox
-  sendAudioToUltravox(data) {
-    // You might also want to rate limit audio to Ultravox
+  // Rate-limited audio sending to LiveKit
+  sendAudioToLiveKit(data) {
+    // You might also want to rate limit audio to LiveKit
     // For now, sending directly, but you could implement similar buffering
-    this.ultravoxService.sendAudio(data);
+    this.livekitService.sendAudio(data);
   }
 
   processDTMF(digit) {
@@ -557,10 +557,10 @@ export class Session {
         })
         .on("final-digits", (digits) => {
           if (
-            this.ultravoxService &&
-            this.ultravoxService.getConnectionStatus()
+            this.livekitService &&
+            this.livekitService.getConnectionStatus()
           ) {
-            this.ultravoxService.sendMessage({
+            this.livekitService.sendMessage({
               type: "user_message",
               text: `DTMF input: ${digits}`,
             });

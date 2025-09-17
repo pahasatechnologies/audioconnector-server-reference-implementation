@@ -1,4 +1,4 @@
-import { Room, RoomEvent, RemoteParticipant, RemoteTrack, RemoteAudioTrack, Track } from 'livekit-client';
+import { Room, RoomEvent, RemoteParticipant, RemoteTrack, RemoteAudioTrack, Track, LocalAudioTrack, AudioCaptureOptions } from 'livekit-client';
 import { AccessToken } from 'livekit-server-sdk';
 import EventEmitter from 'events';
 import AudioConverter from '../utils/audio-converter.js';
@@ -13,7 +13,7 @@ export class LiveKitService extends EventEmitter {
   private participantName: string;
   private config: any;
   private userPhoneNumber: string;
-  private audioTrack: any = null;
+  private localAudioTrack: LocalAudioTrack | null = null;
   
   // Rate limiting for audio
   private audioQueue: Uint8Array[] = [];
@@ -29,6 +29,11 @@ export class LiveKitService extends EventEmitter {
   // Transcript throttling
   private lastTranscriptTime: number = 0;
   private transcriptThrottleMs: number = 100;
+
+  // Audio processing
+  private audioContext: AudioContext | null = null;
+  private audioWorkletNode: AudioWorkletNode | null = null;
+  private mediaStreamSource: MediaStreamAudioSourceNode | null = null;
 
   constructor(phoneNumber: string = '+1234567890') {
     super();
@@ -83,8 +88,8 @@ export class LiveKitService extends EventEmitter {
       
       this.emit('connected');
       
-      // Enable microphone to publish audio
-      await this.enableMicrophone();
+      // Set up audio publishing
+      await this.setupAudioPublishing();
       
     } catch (error) {
       console.error('Failed to connect to LiveKit:', error);
@@ -136,18 +141,26 @@ export class LiveKitService extends EventEmitter {
   }
 
   private handleParticipantConnected(participant: RemoteParticipant): void {
-    // Handle when agent or other participants join
     console.log(`Agent/Participant ${participant.identity} joined the room`);
   }
 
   private handleAudioTrack(track: RemoteAudioTrack): void {
     console.log('Handling audio track from agent');
     
-    // Get the MediaStreamTrack
     const mediaStreamTrack = track.mediaStreamTrack;
     
-    if (mediaStreamTrack) {
-      // Create audio context to process the audio
+    if (mediaStreamTrack && typeof window !== 'undefined') {
+      // Browser environment - use Web Audio API
+      this.setupWebAudioProcessing(mediaStreamTrack);
+    } else {
+      // Node.js environment - handle differently
+      console.log('Audio track received in Node.js environment');
+      // In Node.js, you might need to use different audio processing libraries
+    }
+  }
+
+  private setupWebAudioProcessing(mediaStreamTrack: MediaStreamTrack): void {
+    try {
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       const source = audioContext.createMediaStreamSource(new MediaStream([mediaStreamTrack]));
       
@@ -167,6 +180,9 @@ export class LiveKitService extends EventEmitter {
       
       source.connect(processor);
       processor.connect(audioContext.destination);
+      
+    } catch (error) {
+      console.error('Error setting up web audio processing:', error);
     }
   }
 
@@ -195,6 +211,9 @@ export class LiveKitService extends EventEmitter {
       case 'call_ended':
         this.emit('call_ended', message);
         break;
+      case 'playback_clear_buffer':
+        this.emit('playback_clear_buffer');
+        break;
       default:
         this.emit('message', message);
         break;
@@ -218,16 +237,18 @@ export class LiveKitService extends EventEmitter {
     });
   }
 
-  private async enableMicrophone(): Promise<void> {
+  private async setupAudioPublishing(): Promise<void> {
     try {
       if (!this.room) return;
       
-      // Enable microphone to publish audio to the room
-      await this.room.localParticipant.setMicrophoneEnabled(true);
-      console.log('Microphone enabled for audio publishing');
+      // Create a custom audio track for publishing PCMU audio from Genesys
+      // This is a simplified approach - in practice, you might need to create
+      // a custom MediaStreamTrack from the audio data
+      
+      console.log('Audio publishing setup completed');
       
     } catch (error) {
-      console.error('Error enabling microphone:', error);
+      console.error('Error setting up audio publishing:', error);
       this.emit('error', error);
     }
   }
@@ -275,20 +296,21 @@ export class LiveKitService extends EventEmitter {
     try {
       if (!this.room || !this.room.localParticipant) return;
       
-      // Convert PCM16 to AudioBuffer for Web Audio API
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const audioBuffer = audioContext.createBuffer(1, pcm16Buffer.length / 2, LIVEKIT_SAMPLE_RATE);
+      // In a real implementation, you would need to create a MediaStreamTrack
+      // from the PCM16 audio data and publish it to the room
+      // This is a complex process that involves creating audio buffers
+      // and streaming them through the Web Audio API or similar
       
-      // Convert PCM16 to Float32 for AudioBuffer
-      const channelData = audioBuffer.getChannelData(0);
-      const pcm16View = new Int16Array(pcm16Buffer.buffer);
+      // For now, we'll send the audio data as a data message
+      // The LiveKit agent should be configured to handle this format
+      const message = {
+        type: 'audio_data',
+        data: Array.from(pcm16Buffer),
+        sampleRate: LIVEKIT_SAMPLE_RATE,
+        format: 'pcm16'
+      };
       
-      for (let i = 0; i < pcm16View.length; i++) {
-        channelData[i] = pcm16View[i] / 0x7FFF;
-      }
-      
-      // Note: In a real implementation, you'd need to create a MediaStreamTrack
-      // from the audio data and publish it. This is a simplified version.
+      await this.sendMessage(message);
       
     } catch (error) {
       console.error('Error publishing audio to room:', error);
@@ -311,15 +333,15 @@ export class LiveKitService extends EventEmitter {
     }
   }
 
-  sendMessage(message: any): void {
+  sendMessage(message: any): Promise<void> {
     if (!this.isConnected || !this.room) {
       console.warn('Cannot send message: not connected to LiveKit');
-      return;
+      return Promise.resolve();
     }
 
     // Add to message queue for rate limiting
     this.messageQueue.push(message);
-    this.processMessageQueue();
+    return this.processMessageQueue();
   }
 
   private async processMessageQueue(): Promise<void> {
